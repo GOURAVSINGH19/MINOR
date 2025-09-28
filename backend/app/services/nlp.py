@@ -3,15 +3,15 @@ import re
 from typing import List, Tuple, Optional
 
 from sentence_transformers import SentenceTransformer, util
-from transformers import pipeline
+from google import genai
+from google.genai import types
 
 
 # In-memory index built at startup from backend/knowledge_base.txt
 _embed_model: Optional[SentenceTransformer] = None
-_qa_pipeline = None
 _kb_chunks: List[str] = []
 _kb_embeddings = None
-_instruct_pipeline = None
+_gemini_client = None
 
 # Configuration for confidence thresholds
 MIN_CONFIDENCE_THRESHOLD = 0.35  # Minimum similarity score to consider a match
@@ -74,7 +74,8 @@ LEGAL_KEYWORDS = {
     "mobile app", "software", "hardware", "data", "privacy", "personal information",
     "consent", "processing", "storage", "transfer", "breach", "notification",
     "grievance", "officer", "authority", "board", "commission", "tribunal",
-    "appellate", "revisional", "supervisory", "administrative", "quasi-judicial"
+    "appellate", "revisional", "supervisory", "administrative", "quasi-judicial",
+    "url", "website", "link", "portal", "online", "report", "file", "register"
 }
 
 
@@ -89,10 +90,12 @@ def _is_legal_query(query: str) -> bool:
     
     # Check for common legal phrases
     legal_phrases = [
-        "how to file", "where to file", "legal aid", "consumer complaint",
-        "police complaint", "cyber crime", "land dispute", "family dispute",
-        "lost document", "duplicate", "aadhaar", "aadhar", "licence", "license",
-        "court case", "legal advice", "lawyer", "advocate", "fir", "complaint"
+        "how to file", "where to file", "where to report", "how to report",
+        "legal aid", "consumer complaint", "police complaint", "cyber crime", 
+        "land dispute", "family dispute", "lost document", "duplicate", 
+        "aadhaar", "aadhar", "licence", "license", "court case", "legal advice", 
+        "lawyer", "advocate", "fir", "complaint", "tell me the url", "give me link",
+        "website", "portal", "online registration", "how to apply"
     ]
     
     for phrase in legal_phrases:
@@ -106,7 +109,6 @@ def _read_knowledge_base(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
             txt = f.read()
-            # remove a top-level header line like 'Department of Justice (India) Knowledge Base'
             lines = txt.splitlines()
             cleaned_lines = [l for l in lines if not l.strip().lower().startswith('department of justice')]
             return "\n".join(cleaned_lines)
@@ -118,15 +120,12 @@ def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[st
     """Simple sliding-window text chunker."""
     if not text:
         return []
-    # Treat each paragraph as an independent chunk. Do not merge multiple paragraphs
-    # into a single chunk – this preserves Title -> content pairing.
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks: List[str] = []
     for p in paragraphs:
         if len(p) <= chunk_size:
             chunks.append(p)
         else:
-            # split long paragraph into overlapping slices
             start = 0
             while start < len(p):
                 end = min(start + chunk_size, len(p))
@@ -144,49 +143,42 @@ def _clean_chunk_text(s: str) -> str:
     lines = [l.strip() for l in s.splitlines() if l.strip()]
     cleaned = []
     for l in lines:
-        # drop pure markdown headings like '# startup' or '## something'
         if l.startswith("#"):
-            # if the header has useful words, keep them without '#'
             header = l.lstrip('#').strip()
             if header:
                 cleaned.append(header)
             continue
-        # strip leading 'Title:' markers
         if l.lower().startswith('title:'):
             cleaned.append(l.split(':', 1)[1].strip())
             continue
         cleaned.append(l)
     out = " ".join(cleaned)
-    # collapse repeated whitespace
     return " ".join(out.split())
 
 
 async def load_nlp_resources() -> None:
-    """Load embedding model, QA pipeline and build an in-memory vector index from knowledge_base.txt."""
-    global _embed_model, _qa_pipeline, _kb_chunks, _kb_embeddings, _instruct_pipeline
-    hf_home = os.getenv("HF_HOME")
-    if hf_home:
-        os.makedirs(hf_home, exist_ok=True)
-
+    """Load embedding model, Gemini client and build an in-memory vector index from knowledge_base.txt."""
+    global _embed_model, _kb_chunks, _kb_embeddings, _gemini_client
+    
+    print("Loading embedding model...")
     # Sentence-BERT model for semantic similarity
     _embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-    # QA pipeline (local) - HF token optional for remote private models
-    _qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
-
-    # Optional small instruction model to synthesize answers from retrieved context
-    instruct_model = os.getenv("HF_INSTRUCT_MODEL") or "google/flan-t5-small"
+    print("Initializing Gemini client...")
+    # Initialize Gemini client - API key should be in GEMINI_API_KEY environment variable
     try:
-        # Use text2text-generation (seq2seq) for instruction-like prompts
-        _instruct_pipeline = pipeline("text2text-generation", model=instruct_model)
-    except Exception:
-        _instruct_pipeline = None
+        _gemini_client = genai.Client()
+        print("Gemini client initialized successfully!")
+    except Exception as e:
+        print(f"Failed to initialize Gemini client: {e}")
+        print("Make sure GEMINI_API_KEY environment variable is set")
+        _gemini_client = None
 
+    print("Building knowledge base index...")
     # Build KB index from file
     kb_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "knowledge_base.txt")
     kb_text = _read_knowledge_base(kb_path)
     if not kb_text:
-        # leave empty index
         _kb_chunks = []
         _kb_embeddings = None
         return
@@ -194,6 +186,8 @@ async def load_nlp_resources() -> None:
     _kb_chunks = _chunk_text(kb_text, chunk_size=1000, overlap=200)
     if _kb_chunks:
         _kb_embeddings = _embed_model.encode(_kb_chunks, convert_to_tensor=True, normalize_embeddings=True)
+    
+    print("NLP resources loaded successfully!")
 
 
 async def _vector_search(query: str, top_k: int = 3) -> List[Tuple[str, float]]:
@@ -210,44 +204,68 @@ async def _vector_search(query: str, top_k: int = 3) -> List[Tuple[str, float]]:
     return results
 
 
-async def run_qa(question: str, context: str) -> str:
-    assert _qa_pipeline is not None
-    res = _qa_pipeline({"question": question, "context": context})
-    return res.get("answer") or ""
-
-
-async def run_instruct(user_query: str, context: str) -> str:
-    """Run the instruction model (if available) to synthesize a helpful answer."""
-    global _instruct_pipeline
-    if _instruct_pipeline is None:
+async def run_gemini_generation(user_query: str, context: str) -> str:
+    """Generate response using Gemini API with proper prompting."""
+    global _gemini_client
+    
+    if _gemini_client is None:
         return ""
-    prompt = f"Context: {context}\n\nQuestion: {user_query}\n\nAnswer concisely:" 
+    
     try:
-        out = _instruct_pipeline(prompt, max_length=256, truncation=True)
-        if isinstance(out, list) and out:
-            text = out[0].get("generated_text") or out[0].get("text") or ""
-            # return only if reasonably long (avoid single-word replies)
-            if len(text.split()) >= 3:
-                return text
-            return ""
+        # Create a comprehensive prompt for the DoJ chatbot
+        prompt = f"""You are an official Department of Justice (India) chatbot assistant. Your role is to help Indian citizens with legal queries, court procedures, and government services.
+
+Based on the provided context, answer the user's question in a helpful, accurate, and citizen-friendly manner. Follow these guidelines:
+
+1. Be concise but comprehensive
+2. Always include relevant URLs/links when available in the context
+3. Use simple, clear language that common citizens can understand
+4. Focus on practical, actionable information
+5. If the context mentions specific procedures, explain them step-by-step
+6. For government services, mention both online and offline options when available
+
+Context from Knowledge Base:
+{context}
+
+User Question: {user_query}
+
+Please provide a helpful response that directly answers the user's question using the information from the context above."""
+
+        # Generate response with thinking disabled for faster response
+        response = _gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),  # Disable thinking for speed
+                temperature=0.7,
+                max_output_tokens=300,  # Keep responses concise
+                top_p=0.9
+            )
+        )
+        
+        if response and response.text:
+            answer = response.text.strip()
+            # Basic validation - ensure it's a meaningful response
+            if len(answer.split()) >= 5 and not answer.lower().startswith("i don't"):
+                return answer
+        
         return ""
-    except Exception:
+        
+    except Exception as e:
+        print(f"Gemini API call failed: {e}")
         return ""
 
 
 def _get_fallback_response(user_query: str) -> str:
     """Return appropriate fallback response for out-of-scope queries."""
-    # Check if it's a greeting
     greetings = ["hello", "hi", "hey", "good morning", "good evening", "namaste"]
     if any(greeting in user_query.lower() for greeting in greetings):
         return "Hello! I'm here to help you with legal and justice-related queries. How can I assist you with court services, legal procedures, or government services today?"
     
-    # Check if asking about the bot itself
     bot_questions = ["what is your name", "who are you", "what are you", "your name"]
     if any(question in user_query.lower() for question in bot_questions):
         return "I'm the Department of Justice chatbot, designed to help citizens with legal queries, court procedures, and government services. How can I assist you with legal matters today?"
     
-    # Generic out-of-scope response
     return ("I'm designed to help with legal and justice-related queries. I can assist you with:\n"
             "• Court procedures and case status\n"
             "• Filing complaints (consumer, cyber crime, police)\n"
@@ -267,98 +285,81 @@ async def generate_bot_response(user_query: str, db) -> str:
     # Step 2: Vector search in knowledge_base.txt
     matches = await _vector_search(user_query, top_k=5)
     if not matches:
-        matches = []
+        return _get_fallback_response(user_query)
 
     # Step 3: Check confidence threshold on the best match
-    if matches:
-        best_score = matches[0][1]
-        if best_score < MIN_CONFIDENCE_THRESHOLD:
-            return _get_fallback_response(user_query)
+    best_score = matches[0][1]
+    if best_score < MIN_CONFIDENCE_THRESHOLD:
+        return _get_fallback_response(user_query)
 
-    # Step 4: Filter out tiny/noisy chunks (short cleaned text)
+    # Step 4: Filter and rank chunks
     filtered: List[Tuple[str, float, str]] = []
     for chunk, score in matches:
         cleaned = _clean_chunk_text(chunk)
         if len(cleaned.split()) >= 3:
             filtered.append((chunk, score, cleaned))
     
-    # Step 5: Compute simple lexical overlap with the query and rerank
     def _token_set(s: str) -> set:
         toks = [t.lower() for t in re.split(r"\W+", s) if len(t) > 2]
         return set(toks)
 
     q_tokens = _token_set(user_query)
     ranked: List[Tuple[str, float, str, float]] = []
+    
     for chunk, score, cleaned in filtered:
-        # lexical overlap fraction
         chunk_tokens = _token_set(cleaned)
         if not chunk_tokens:
             overlap_frac = 0.0
         else:
             overlap_frac = len(q_tokens & chunk_tokens) / max(1, len(q_tokens))
-        # exact keyword boost for important named tokens
-        keywords = {"aadhaar", "aadhar", "uidai", "e-aadhaar", "e aadhaar"}
-        exact_boost = 0.0
-        if q_tokens & keywords:
-            # if query mentions an important token and chunk contains it, boost
-            if chunk_tokens & keywords:
-                exact_boost = 0.4
-        # composite score: weighted sum + boost
-        composite = 0.65 * score + 0.25 * overlap_frac + exact_boost
+        
+        # Boost for URL-related queries
+        url_boost = 0.0
+        if any(word in user_query.lower() for word in ["url", "link", "website", "portal", "tell me the"]):
+            if any(word in cleaned.lower() for word in ["http", "www", ".gov", ".in", ".com", "portal"]):
+                url_boost = 0.3
+        
+        # Boost for exact keyword matches
+        keyword_boost = 0.0
+        important_keywords = {"cyber", "crime", "consumer", "complaint", "aadhaar", "licence", "legal", "aid"}
+        if q_tokens & important_keywords:
+            if chunk_tokens & important_keywords:
+                keyword_boost = 0.2
+        
+        composite = 0.6 * score + 0.2 * overlap_frac + url_boost + keyword_boost
         ranked.append((chunk, score, cleaned, composite))
 
-    # Step 6: Sort by composite score and check threshold
     ranked.sort(key=lambda x: x[3], reverse=True)
 
     if not ranked or ranked[0][3] < MIN_COMPOSITE_THRESHOLD:
         return _get_fallback_response(user_query)
 
-    # Step 7: Try to generate answer with the top chunk
+    # Step 5: Try Gemini generation with the best context(s)
     if ranked:
-        top_chunk, top_score, top_cleaned, top_composite = ranked[0]
+        # Use top 2 chunks for better context
+        top_contexts = [chunk[2] for chunk in ranked[:2]]
+        combined_context = "\n\n".join(top_contexts)
         
-        # Try instruction model on the top chunk alone
-        if _instruct_pipeline is not None:
-            instruct_ans = await run_instruct(user_query, top_cleaned)
-            if instruct_ans and instruct_ans.strip() and len(instruct_ans.split()) >= 3:
-                return instruct_ans.strip()
+        # Try Gemini API first
+        if _gemini_client is not None:
+            gemini_response = await run_gemini_generation(user_query, combined_context)
+            if gemini_response and len(gemini_response.split()) >= 5:
+                return gemini_response
 
-        # Try QA on the top chunk alone
-        if _qa_pipeline is not None:
-            qa_ans = await run_qa(user_query, top_cleaned)
-            if qa_ans and qa_ans.strip() and len(qa_ans.split()) >= 3:
-                return qa_ans.strip()
+        # Fallback to returning cleaned context if Gemini fails
+        top_cleaned = ranked[0][2]
+        if top_cleaned:
+            # Extract key sentences
+            sents = re.split(r'(?<=[.!?])\s+', top_cleaned)
+            good_sents = [s for s in sents if len(s.split()) >= 3]
+            
+            if good_sents:
+                # Return first 2-3 sentences that contain useful information
+                result = " ".join(good_sents[:3]).strip()
+                if len(result) > 20:  # Ensure it's substantial
+                    return result[:800]
 
-    # Step 8: If top-1 failed, try combined top-K filtered chunks (fallback)
-    if ranked:
-        combined = "\n\n".join([c for c, _, _, _ in ranked[:3]])[:8000]
-        if combined:
-            if _instruct_pipeline is not None:
-                instruct_ans = await run_instruct(user_query, combined)
-                if instruct_ans and instruct_ans.strip() and len(instruct_ans.split()) >= 3:
-                    return instruct_ans.strip()
-            if _qa_pipeline is not None:
-                qa_ans = await run_qa(user_query, combined)
-                if qa_ans and qa_ans.strip() and len(qa_ans.split()) >= 3:
-                    return qa_ans.strip()
-
-    # Step 9: If QA failed, return a cleaned short summary of the best chunk
-    if matches and matches[0][1] >= MIN_CONFIDENCE_THRESHOLD:
-        best_context, score = matches[0]
-        summary = _clean_chunk_text(best_context)
-        if summary:
-            # split into sentences and return first 1-2 sentences
-            sents = re.split(r'(?<=[.!?])\s+', summary)
-            good = [s for s in sents if len(s.split()) >= 3]
-            if good:
-                rtn = " ".join(good[:2]).strip()
-                if len(rtn) > 0:
-                    return rtn[:800]
-            # otherwise, fallback to whole cleaned summary if it's reasonable
-            if len(summary.split()) >= 3:
-                return summary[:800]
-
-    # Step 10: Fallback to DB-stored FAQs (legacy support)
+    # Step 6: Fallback to DB-stored FAQs (legacy support)
     try:
         fetched: List[Tuple[str, str]] = []
         async for doc in db.faqs.find({}):
@@ -373,13 +374,11 @@ async def generate_bot_response(user_query: str, db) -> str:
             if best_score >= 0.40:
                 return fetched[best_idx][1]
     except Exception:
-        # ignore DB errors and continue to final fallback
         pass
 
-    # Step 11: Final fallback
+    # Final fallback
     return _get_fallback_response(user_query)
 
 
 async def seed_default_faqs(db) -> None:
-    # keep legacy function but do not seed US-centric defaults
     return
