@@ -14,8 +14,8 @@ _kb_embeddings = None
 _gemini_client = None
 
 # Configuration for confidence thresholds
-MIN_CONFIDENCE_THRESHOLD = 0.35  # Minimum similarity score to consider a match
-MIN_COMPOSITE_THRESHOLD = 0.40   # Minimum composite score for returning an answer
+MIN_CONFIDENCE_THRESHOLD = 0.25  # Lowered from 0.35 - be more permissive
+MIN_COMPOSITE_THRESHOLD = 0.30   # Lowered from 0.40 - be more permissive
 
 # Legal keywords for intent detection
 LEGAL_KEYWORDS = {
@@ -91,16 +91,25 @@ def _is_legal_query(query: str) -> bool:
     # Check for common legal phrases
     legal_phrases = [
         "how to file", "where to file", "where to report", "how to report",
+        "guide me", "please guide", "process of filing", "filing process",
+        "step by step", "what is the procedure", "how do i", "what should i do",
         "legal aid", "consumer complaint", "police complaint", "cyber crime", 
         "land dispute", "family dispute", "lost document", "duplicate", 
         "aadhaar", "aadhar", "licence", "license", "court case", "legal advice", 
         "lawyer", "advocate", "fir", "complaint", "tell me the url", "give me link",
-        "website", "portal", "online registration", "how to apply"
+        "website", "portal", "online registration", "how to apply", "filing the case",
+        "file a case", "court procedure", "what documents", "which court",
+        "legal process", "procedure", "next steps", "what to do next"
     ]
     
     for phrase in legal_phrases:
         if phrase in query_lower:
             return True
+    
+    # Additional check: if query contains process/procedure words + any legal keyword
+    process_words = ["process", "procedure", "guide", "steps", "how", "what", "filing", "file"]
+    if any(word in query_lower for word in process_words) and query_words & LEGAL_KEYWORDS:
+        return True
     
     return False
 
@@ -217,19 +226,22 @@ async def run_gemini_generation(user_query: str, context: str) -> str:
 
 Based on the provided context, answer the user's question in a helpful, accurate, and citizen-friendly manner. Follow these guidelines:
 
-1. Be concise but comprehensive
+1. Be comprehensive and detailed when user asks for "process", "procedure", "steps", or "guide me"
 2. Always include relevant URLs/links when available in the context
 3. Use simple, clear language that common citizens can understand
-4. Focus on practical, actionable information
-5. If the context mentions specific procedures, explain them step-by-step
+4. Focus on practical, actionable information with step-by-step guidance
+5. If the context mentions specific procedures, explain them completely with all steps
 6. For government services, mention both online and offline options when available
+7. Use bullet points or numbered lists for step-by-step processes
+8. Include required documents, fees, and timelines when mentioned in context
+9. If user is asking follow-up questions about legal processes, assume they want detailed procedural guidance
 
 Context from Knowledge Base:
 {context}
 
 User Question: {user_query}
 
-Please provide a helpful response that directly answers the user's question using the information from the context above."""
+Important: If the user is asking about "process", "procedure", "how to file", "guide me", or similar procedural questions, provide detailed step-by-step instructions from the context. Don't give generic responses - give specific, actionable steps they can follow."""
 
         # Generate response with thinking disabled for faster response
         response = _gemini_client.models.generate_content(
